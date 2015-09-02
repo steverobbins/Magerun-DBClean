@@ -1,0 +1,6 @@
+autoloaders:
+  Dbclean: %module%/src
+
+commands:
+   customCommands:
+       - Dbclean\Magento\Command\Database\Maintain\CleanCommand
