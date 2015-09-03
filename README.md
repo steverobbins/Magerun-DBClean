@@ -1,7 +1,9 @@
 DB Cleaning Plugin for n98 MageRun
 ===
 
-** Disclaimer:  This is super dangerous and should probably never be used.  So... shoo **
+** Disclaimer:  This is super dangerous and is for advanced users only.  Always make backups! **
+
+![image](https://i.imgur.com/b8LW5uW.png)
 
 ## Installation
 

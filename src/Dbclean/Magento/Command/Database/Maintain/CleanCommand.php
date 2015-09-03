@@ -10,6 +10,58 @@ use Symfony\Component\Console\Output\OutputInterface;
 
 class CleanCommand extends AbstractMagentoCommand
 {
+    /**
+     * Forcfulling run?  Will not prompt for confirmation
+     *
+     * @var boolean
+     */
+    protected $force;
+
+    /**
+     * Write connection to DB
+     *
+     * @var \Varien_Db_Adapter_Interface
+     */
+    protected $dbWrite;
+
+    /**
+     * Read connection to DB
+     *
+     * @var \Varien_Db_Adapter_Interface
+     */
+    protected $dbRead;
+
+    /**
+     * Dialog helper
+     *
+     * @var \Symfony\Component\Console\Helper\DialogHelper
+     */
+    protected $dialog;
+
+    /**
+     * Resource singleton
+     *
+     * @var \Mage_Core_Model_Resource
+     */
+    protected $coreResource;
+
+    /**
+     * @var OutputInterface
+     */
+    protected $output;
+
+    /**
+     * List of tables in DB
+     *
+     * @var string[]
+     */
+    protected $tables;
+
+    /**
+     * Groups of resources to truncate
+     *
+     * @var array
+     */
     protected $groups = array(
         'Cache' => array(
             'core/cache',
@@ -59,6 +111,11 @@ class CleanCommand extends AbstractMagentoCommand
         ),
     );
 
+    /**
+     * Setup command
+     *
+     * @return void
+     */
     protected function configure()
     {
         $this
@@ -72,40 +129,89 @@ class CleanCommand extends AbstractMagentoCommand
             );;
     }
 
+    /**
+     * Run the command
+     *
+     * @param InputInterface  $input
+     * @param OutputInterface $output
+     *
+     * @return void
+     */
     public function execute(InputInterface $input, OutputInterface $output)
     {
-        $this->detectMagento($output, true);
+        $this->output = $output;
+        $this->detectMagento($this->output, true);
         if (!$this->initMagento()) {
             return;
         }
-        $force        = $input->getOption('force');
-        $dbWrite      = \Mage::getSingleton('core/resource')->getConnection('core_write');
-        $dialog       = $this->getHelper('dialog');
-        $coreResource = \Mage::getSingleton('core/resource');
-        if (!$force) {
-            $confirm = $dialog->askConfirmation(
-                $output,
+        $this->force  = $input->getOption('force');
+        $this->dialog = $this->getHelper('dialog');
+        if (!$this->preExecuteWarning()) {
+            return;
+        }
+        $this->coreResource = \Mage::getSingleton('core/resource');
+        $this->dbRead       = \Mage::getSingleton('core/resource')->getConnection('core_read');
+        $this->dbWrite      = \Mage::getSingleton('core/resource')->getConnection('core_write');
+        $this->tables       = $this->getTables();
+        $this->dbWrite->query('SET foreign_key_checks = 0');
+        $this->truncateResourceGroups();
+        $this->cleanMatch('/_cl$/', 'Changelog', 'truncate');
+        $this->cleanMatch('/_category_flat_/', 'Category Flat', 'drop');
+        $this->cleanMatch('/_product_flat_/', 'Product Flat', 'drop');
+        $this->dbWrite->query('SET foreign_key_checks = 1');
+    }
+
+    /**
+     * Prompt the user that they're about to do something destructive
+     *
+     * @return boolean
+     */
+    protected function preExecuteWarning()
+    {
+        if (!$this->force) {
+            return $this->dialog->askConfirmation(
+                $this->output,
                 '<question>You\'re about to f@!* with your database.  Are you sure you want to continue?</question> ',
                 false
             );
-            if (!$confirm) {
-                return;
-            }
         }
-        $dbWrite->query('SET foreign_key_checks = 0');
+        return true;
+    }
+
+    /**
+     * Get tables in DB
+     *
+     * @return string[]
+     */
+    protected function getTables()
+    {
+        $stmt = $this->dbRead->query('SHOW TABLES');
+        $stmt->execute();
+        $tables = array();
+        return $stmt->fetchAll(\PDO::FETCH_COLUMN);
+    }
+
+    /**
+     * Loop through resource groups and truncate tables
+     *
+     * @return void
+     */
+    protected function truncateResourceGroups()
+    {        
         foreach ($this->groups as $name => $resources) {
             $this->prepareResources($resources);
             if (!count($resources)) {
                 continue;
             }
-            if (!$force) {
-                $output->writeln(sprintf('<info>%s</info> table(s):', $name));
-                $table = new Table($output);
+            array_walk($resources, array($this, 'prepareArrayForTableOutput'));
+            if (!$this->force) {
+                $this->output->writeln(sprintf('<info>%s</info> table(s):', $name));
+                $table = new Table($this->output);
                 $table
                     ->setRows($resources)
                     ->render();
-                $confirm = $dialog->askConfirmation(
-                    $output,
+                $confirm = $this->dialog->askConfirmation(
+                    $this->output,
                     '<question>Truncate table(s)?</question> ',
                     false
                 );
@@ -117,18 +223,24 @@ class CleanCommand extends AbstractMagentoCommand
                 if (!$resourceName[0]) {
                     continue;
                 }
-                $dbWrite->truncateTable($resourceName[0]);
-                $output->writeln(sprintf('Truncated <info>%s</info>', $resourceName[0]));
+                $this->dbWrite->truncateTable($resourceName[0]);
+                $this->output->writeln(sprintf('Truncate <info>%s</info>', $resourceName[0]));
             }
         }
-        $dbWrite->query('SET foreign_key_checks = 1');
     }
 
+    /**
+     * Extract table names and prepare for cli rendering
+     *
+     * @param array $resources
+     *
+     * @return void
+     */
     protected function prepareResources(&$resources)
     {
         foreach ($resources as $key => &$resource) {
             try {
-                $table = \Mage::getSingleton('core/resource')->getTableName($resource);   
+                $table = $this->coreResource->getTableName($resource);   
             } catch (\Mage_Core_Exception $e) {
                 // table not exists
                 $table = false;
@@ -136,8 +248,57 @@ class CleanCommand extends AbstractMagentoCommand
             if ($table === false) {
                 unset($resources[$key]);
             } else {
-                $resource = array($table);
+                $resource = $table;
             }
+        }
+    }
+
+    /**
+     * Walk through array and set row columns
+     *
+     * @param  string $value
+     *
+     * @return void
+     */
+    protected function prepareArrayForTableOutput(&$value)
+    {
+        $value = array($value);
+    }
+
+    /**
+     * Find and truncate/drop matched tables
+     *
+     * @param string $pattern
+     * @param string $name
+     * @param string $action
+     *
+     * @return void
+     */
+    protected function cleanMatch($pattern, $name, $action)
+    {
+        $tables = preg_grep($pattern, $this->tables);
+        if (!count($tables)) {
+            return;
+        }
+        array_walk($tables, array($this, 'prepareArrayForTableOutput'));
+        if (!$this->force) {
+            $this->output->writeln(sprintf('<info>%s</info> table(s):', $name));
+            $table = new Table($this->output);
+            $table
+                ->setRows($tables)
+                ->render();
+            $confirm = $this->dialog->askConfirmation(
+                $this->output,
+                sprintf('<question>%s table(s)?</question> ', ucfirst($action)),
+                false
+            );
+            if (!$confirm) {
+                return;
+            }
+        }
+        foreach ($tables as $table) {
+            $this->dbWrite->{$action . 'Table'}($table[0]);
+            $this->output->writeln(sprintf('%s <info>%s</info>', ucfirst($action), $table[0]));
         }
     }
 }
